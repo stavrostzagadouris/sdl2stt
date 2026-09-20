@@ -4,7 +4,8 @@
 #
 #   talk start    begin recording (talkwave: libpulse capture + level meter + WAV)
 #   talk stop     stop, transcribe, wtype the result
-#   talk toggle   start if idle, stop if recording   (bound to SUPER+SPACE)
+#   talk toggle   start if idle, stop if recording
+#   talk watchdog ends a push-to-talk hold when the key repeats stop (internal)
 #
 # talkwave captures the default source itself (libpulse pa_simple), so there's
 # no external recorder and nothing lost on kill — it finalizes the WAV itself.
@@ -41,6 +42,43 @@ recording() {
   return 1
 }
 
+BEAT="$HOME/.cache/talk.beat"
+
+# Hold-watchdog. Hyprland never dispatches the SPACE keyup once the
+# SUPER+SPACE press bind has consumed the press -- verified at the compositor:
+# a bare-SPACE release bind fires for ordinary typed spaces and goes silent for
+# the entire duration of the chord, in either release order. So the release
+# event cannot be used to end a push-to-talk hold at all.
+# Key REPEAT can: the press bind is `repeating`, and a repeat only matches
+# while SUPER *and* SPACE are both still down -- lift either one, in either
+# order, and the beats stop. The bind writes $BEAT on every repeat (in-process,
+# see the Lua in README), this deletes it and watches for it to come back.
+#
+# "Delete it and see if it returns" rather than comparing mtimes keeps the poll
+# to pure bash with no fork per tick. The 0.9 s grace clears the 600 ms
+# repeat_delay before the first beat is due, so a short tap records ~1 s rather
+# than being cut off -- raise it if your repeat_delay is longer.
+watchdog() {
+  local waited=0
+  sleep 0.9
+  while [ -f "$STATE" ]; do
+    rm -f "$BEAT"
+    sleep 0.2
+    if [ ! -f "$BEAT" ]; then
+      log "watchdog: beats stopped, ending hold"
+      stop stop repeat
+      return 0
+    fi
+    # Backstop: never record forever if the beats somehow keep arriving.
+    waited=$((waited + 1))
+    if [ "$waited" -gt 600 ]; then       # 600 * 0.2 s = 2 min
+      log "watchdog: 2 min cap hit"
+      stop stop cap
+      return 0
+    fi
+  done
+}
+
 start() {
   # Push-to-talk: if a release event was missed (e.g. the modifier was let go
   # before the key), a recorder can still be alive. Clear it rather than
@@ -62,6 +100,10 @@ start() {
   local job=$!
   printf '%s %s\n' "$job" "$wav" > "$STATE"
   log "start: pid $job -> $wav"
+  : > "$BEAT"
+  # setsid: the watchdog must outlive this invocation, which the compositor
+  # reaps as soon as the bind's command returns.
+  setsid -f "$0" watchdog >/dev/null 2>&1
 }
 
 # Why did the endpoint not answer? Distinguishes the three cases that otherwise
@@ -95,7 +137,13 @@ print("%s is not on the tailnet." % peer)
 }
 
 stop() {
-  [ -f "$STATE" ] || { log "stop: not recording"; return 0; }
+  # Silent no-op when idle. This matters: `stop` is also on a bare SUPER-release
+  # bind (the panic key, see README) which fires on every SUPER+<anything>
+  # chord, so logging here would bury the log in "not recording" lines.
+  # The trigger tag -- repeat | super | cap -- is what made the original bug
+  # legible: every stop read "super", i.e. the keyup path never once fired.
+  [ -f "$STATE" ] || return 0
+  log "stop: triggered by ${2:-?}"
   local job wav; read -r job wav < "$STATE"
   kill -TERM "$job" 2>/dev/null || true   # talkwave finalizes the WAV on SIGTERM
   # `wait` can't be used: talkwave was started by a *different* shell (the
@@ -188,7 +236,8 @@ except Exception:
 
 case "${1:-}" in
   start)  start ;;
-  stop)   stop ;;
+  stop)     stop "$@" ;;
+  watchdog) watchdog ;;
   toggle) if recording; then stop; else start; fi ;;
-  *) echo "usage: talk {start|stop|toggle}" >&2; exit 2 ;;
+  *) echo "usage: talk {start|stop|toggle|watchdog}" >&2; exit 2 ;;
 esac

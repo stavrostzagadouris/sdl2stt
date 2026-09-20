@@ -72,16 +72,65 @@ bind.
 
 ## Bind it
 
-Hold-to-talk is a press bind and a release bind on the **same** key spec. Hyprland, flat
-config:
+### Ending the hold: do not use the release bind
+
+The obvious wiring — `bind` to start, `bindr` on the same key spec to stop — **does not
+work on Hyprland**, and it fails in a way that looks intermittent:
 
 ```
-bind  = SUPER, SPACE, exec, /home/you/.local/bin/talk start
-bindr = SUPER, SPACE, exec, /home/you/.local/bin/talk stop
+bind  = SUPER, SPACE, exec, talk start
+bindr = SUPER, SPACE, exec, talk stop     # <-- silently never fires
+```
+
+A release bind carrying a modmask only matches while that modifier is *still physically
+down*, so it fires only if you release SPACE before SUPER. Releasing SUPER first — the
+natural way to end a hold — drops the keyup, `talk stop` never runs, and the recorder keeps
+going until something else kills it.
+
+Neither obvious workaround helps. Verified on Hyprland 0.56.2, with a bind that logged
+every dispatch:
+
+* A bare `SUPER_L` release bind fires on a *fresh* SUPER tap, but not on the SUPER keyup
+  that ends a `SUPER+<key>` chord.
+* A bare `SPACE` release bind with `ignore_mods` fires for ordinary typed spaces and goes
+  **completely silent** for the whole duration of the chord — once the press bind consumes
+  the press, the keyup is not offered to any other bind, in either release order.
+
+So the hold is ended by **key repeat** instead. A repeat only matches while both keys are
+still down, so it stops the instant either one lifts, whichever goes first:
+
+```
+bind  = SUPER, SPACE, exec, talk start    # + the `e` (repeat) flag -- see the Lua below
+bindr = SUPER, SPACE, exec, talk stop super   # optional panic key
 
 windowrulev2 = float, class:^(talkwave)$
 windowrulev2 = pin,   class:^(talkwave)$
 ```
+
+The repeat fires ~25x/s, so the handler must not fork a process each time. Keep it in the
+compositor. Hyprland's Lua config:
+
+```lua
+local TALK_STATE = os.getenv("HOME") .. "/.cache/talk.state"
+local TALK_BEAT  = os.getenv("HOME") .. "/.cache/talk.beat"
+
+local function talk_press()
+    local b = io.open(TALK_BEAT, "w")
+    if b then b:write("1"); b:close() end
+    local f = io.open(TALK_STATE, "r")
+    if f then f:close(); return end     -- already recording: this was a repeat
+    hl.exec_cmd("/home/you/.local/bin/talk start")
+end
+
+hl.bind("SUPER + SPACE", function() talk_press() end, { repeating = true })
+```
+
+`talk start` detaches a watchdog that deletes `talk.beat` every 200 ms; the first time it
+does not reappear, the hold is over and the recording is transcribed. It also enforces a
+2-minute cap, so a missed stop can never record indefinitely.
+
+One consequence worth knowing: a very short tap records about a second, because the
+watchdog waits out Hyprland's 600 ms `repeat_delay` before it starts looking for beats.
 
 Use an absolute path: the compositor spawns children with a PATH that need not include
 `~/.local/bin`.
