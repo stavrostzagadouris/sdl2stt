@@ -2,7 +2,7 @@
 #
 # talk — voice input: record -> STT -> type the transcript into the focused field.
 #
-#   talk start    begin recording (talkwave: libpulse capture + level meter + WAV)
+#   talk start    begin a push-to-talk recording (ended by the watchdog, see below)
 #   talk stop     stop, transcribe, wtype the result
 #   talk toggle   start if idle, stop if recording
 #   talk watchdog ends a push-to-talk hold when the key repeats stop (internal)
@@ -22,11 +22,24 @@ STT_URL="${TALK_STT_URL:-http://127.0.0.1:5000/v1/audio/transcriptions}"
 # Empty disables the Tailscale-specific diagnosis.
 STT_PEER="${TALK_STT_PEER:-}"
 STATE="$HOME/.cache/talk.state"
+BEAT="$HOME/.cache/talk.beat"
 LOG="$HOME/.cache/talk.log"
+# Recordings are microphone audio: keep them in the per-user runtime dir (0700,
+# tmpfs) rather than world-listable /tmp when there is one.
+WAVDIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"
 
 mkdir -p "$(dirname "$STATE")"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >> "$LOG"; }
+
+# Keep the log from growing without bound: past ~1 MB, keep the last 2000 lines.
+trim_log() {
+  local size
+  size="$(stat -c %s "$LOG" 2>/dev/null || echo 0)"
+  if [ "$size" -gt 1000000 ]; then
+    tail -n 2000 "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
+  fi
+}
 
 # True only if the state file names a process that is actually alive.
 # A stale state file (recorder died) is cleared, so a failure can never
@@ -42,13 +55,26 @@ recording() {
   return 1
 }
 
-BEAT="$HOME/.cache/talk.beat"
+# True while the state file still names recorder $1. Pure bash, no fork: the
+# watchdog calls this five times a second.
+state_is() {
+  [ -f "$STATE" ] || return 1
+  local job _rest
+  read -r job _rest < "$STATE" 2>/dev/null
+  [ "${job:-}" = "$1" ]
+}
 
-# Hold-watchdog. Hyprland never dispatches the SPACE keyup once the
-# SUPER+SPACE press bind has consumed the press -- verified at the compositor:
-# a bare-SPACE release bind fires for ordinary typed spaces and goes silent for
-# the entire duration of the chord, in either release order. So the release
-# event cannot be used to end a push-to-talk hold at all.
+# Watchdog for ONE recording: `talk watchdog <pid> <hold|cap>`.
+#
+# It is tied to the recorder's PID and exits as soon as the state file stops
+# naming it, so a watchdog left over from an earlier recording can never end a
+# later one.
+#
+# hold mode -- Hyprland never dispatches the SPACE keyup once the SUPER+SPACE
+# press bind has consumed the press -- verified at the compositor: a bare-SPACE
+# release bind fires for ordinary typed spaces and goes silent for the entire
+# duration of the chord, in either release order. So the release event cannot
+# be used to end a push-to-talk hold at all.
 # Key REPEAT can: the press bind is `repeating`, and a repeat only matches
 # while SUPER *and* SPACE are both still down -- lift either one, in either
 # order, and the beats stop. The bind writes $BEAT on every repeat (in-process,
@@ -58,28 +84,36 @@ BEAT="$HOME/.cache/talk.beat"
 # to pure bash with no fork per tick. The 0.9 s grace clears the 600 ms
 # repeat_delay before the first beat is due, so a short tap records ~1 s rather
 # than being cut off -- raise it if your repeat_delay is longer.
+#
+# cap mode -- used by `talk toggle`, where nothing writes beats. Only the
+# 2-minute backstop applies.
 watchdog() {
-  local waited=0
-  sleep 0.9
-  while [ -f "$STATE" ]; do
-    rm -f "$BEAT"
+  local pid="${1:-}" mode="${2:-hold}" waited=0
+  [ -n "$pid" ] || return 0
+  [ "$mode" = hold ] && sleep 0.9
+  while state_is "$pid"; do
+    [ "$mode" = hold ] && rm -f "$BEAT"
     sleep 0.2
-    if [ ! -f "$BEAT" ]; then
+    if [ "$mode" = hold ] && [ ! -f "$BEAT" ]; then
       log "watchdog: beats stopped, ending hold"
-      stop stop repeat
+      stop stop repeat "$pid"
       return 0
     fi
-    # Backstop: never record forever if the beats somehow keep arriving.
+    # Backstop: never record forever.
     waited=$((waited + 1))
     if [ "$waited" -gt 600 ]; then       # 600 * 0.2 s = 2 min
       log "watchdog: 2 min cap hit"
-      stop stop cap
+      stop stop cap "$pid"
       return 0
     fi
   done
 }
 
+# start [hold|cap] -- hold (default) is push-to-talk and needs the repeating
+# bind to keep it alive; cap is for toggle use.
 start() {
+  local mode="${1:-hold}"
+  trim_log
   # Push-to-talk: if a release event was missed (e.g. the modifier was let go
   # before the key), a recorder can still be alive. Clear it rather than
   # stacking a second one — that is what produced duplicate recorders.
@@ -93,17 +127,25 @@ start() {
       kill -0 "$old" 2>/dev/null || break
       sleep 0.1
     done
-    rm -f "$oldwav" "$STATE"
+    rm -f "$oldwav" "$oldwav.part" "$STATE"
   fi
-  local wav; wav="$(mktemp -t talk.XXXXXX).wav"
+  # mktemp creates the (empty) file itself, so the name is ours. talkwave
+  # writes <wav>.part and renames it over this, which makes "non-empty" mean
+  # "complete".
+  local wav
+  wav="$(mktemp --suffix=.wav "$WAVDIR/talk.XXXXXX")" || {
+    log "start: mktemp failed in $WAVDIR"
+    notify-send -u critical -a talk "Voice input failed" "Could not create a temp file in $WAVDIR."
+    return 1
+  }
   talkwave --out "$wav" >>"$LOG" 2>&1 &
   local job=$!
   printf '%s %s\n' "$job" "$wav" > "$STATE"
-  log "start: pid $job -> $wav"
-  : > "$BEAT"
+  log "start: pid $job -> $wav ($mode)"
+  [ "$mode" = hold ] && : > "$BEAT"
   # setsid: the watchdog must outlive this invocation, which the compositor
   # reaps as soon as the bind's command returns.
-  setsid -f "$0" watchdog >/dev/null 2>&1
+  setsid -f "$0" watchdog "$job" "$mode" >/dev/null 2>&1
 }
 
 # Why did the endpoint not answer? Distinguishes the three cases that otherwise
@@ -136,31 +178,15 @@ print("%s is not on the tailnet." % peer)
 ' "$STT_PEER" 2>/dev/null || echo "Could not reach Tailscale to diagnose."
 }
 
-stop() {
-  # Silent no-op when idle. This matters: `stop` is also on a bare SUPER-release
-  # bind (the panic key, see README) which fires on every SUPER+<anything>
-  # chord, so logging here would bury the log in "not recording" lines.
-  # The trigger tag -- repeat | super | cap -- is what made the original bug
-  # legible: every stop read "super", i.e. the keyup path never once fired.
-  [ -f "$STATE" ] || return 0
-  log "stop: triggered by ${2:-?}"
-  local job wav; read -r job wav < "$STATE"
-  kill -TERM "$job" 2>/dev/null || true   # talkwave finalizes the WAV on SIGTERM
-  # `wait` can't be used: talkwave was started by a *different* shell (the
-  # `start` invocation), so it is not a child of this one and wait returns
-  # immediately — which would race curl against the WAV still being written.
-  for _ in $(seq 1 50); do
-    kill -0 "$job" 2>/dev/null || break
-    sleep 0.1
-  done
-  rm -f "$STATE"
-
-  if [ ! -s "$wav" ]; then log "stop: no audio at $wav"; rm -f "$wav"; return 0; fi
+# Gate, POST and parse one finished WAV. Prints the transcript on stdout (empty
+# if there is nothing to type); every failure is logged and notified here.
+transcribe() {
+  local wav="$1"
 
   # Noise gate. Parakeet invents words out of room noise, and wtype would type
   # them into whatever field has focus. Measured on this mic at 40% volume:
   # background TV + conversation sits at window-RMS ~0.003, so a 0.02 floor with
-  # a 3-window (60 ms) minimum rejects the room but passes real speech.
+  # a 3-window (60 ms total) minimum rejects the room but passes real speech.
   # Override with TALK_GATE=<rms>. Fails OPEN: a measurement error must never
   # silently discard a real recording.
   local gate="${TALK_GATE:-0.02}" meas pk lw verdict
@@ -189,7 +215,6 @@ PYGATE
   read -r pk lw verdict <<< "$meas"
   log "stop: level peak=$pk loud_windows=$lw -> $verdict"
   if [ "$verdict" = "quiet" ]; then
-    rm -f "$wav"
     notify-send -a talk "Voice input" "No speech detected."
     return 0
   fi
@@ -204,7 +229,6 @@ PYGATE
   local rc=$?
   code="${body##*$'\n'}"
   body="${body%$'\n'*}"
-  rm -f "$wav"
 
   if [ $rc -ne 0 ]; then
     local why; why="$(diagnose_failure)"
@@ -225,19 +249,84 @@ try:
 except Exception:
     pass' 2>/dev/null)"
 
-  if [ -n "$text" ]; then
-    log "stop: typing ${#text} chars"
-    wtype -- "$text"
-  else
+  if [ -z "$text" ]; then
     log "stop: empty transcription"
     notify-send -a talk "Voice input" "No speech detected."
+    return 0
+  fi
+  printf '%s' "$text"
+}
+
+# stop <ignored> [trigger] [pid]
+#   trigger  repeat | super | cap | toggle -- only for the log. It is what made
+#            the original bug legible: every stop read "super", i.e. the keyup
+#            path never once fired.
+#   pid      if given, only stop the recording made by that recorder.
+stop() {
+  local trigger="${2:-?}" expect="${3:-}"
+  # Silent no-op when idle. This matters: `stop` is also on a bare SUPER-release
+  # bind (the panic key, see README) which fires on every SUPER+<anything>
+  # chord, so logging here would bury the log in "not recording" lines.
+  [ -f "$STATE" ] || return 0
+  # A watchdog only ever stops its own recording.
+  if [ -n "$expect" ] && ! state_is "$expect"; then return 0; fi
+
+  # Claim the recording by renaming the state file. rename() is atomic, so when
+  # the watchdog and the panic bind both fire for one release, exactly one of
+  # them gets it -- without this both would transcribe and type the same clip.
+  local claim="$STATE.$$" job wav
+  mv "$STATE" "$claim" 2>/dev/null || return 0
+  read -r job wav < "$claim"
+  if [ -n "$expect" ] && [ "${job:-}" != "$expect" ]; then
+    # It changed between the check above and the claim: hand it back untouched.
+    mv "$claim" "$STATE"
+    return 0
+  fi
+  rm -f "$claim"
+  log "stop: triggered by $trigger"
+
+  # SIGUSR1: talkwave stops capturing, writes the WAV, and keeps its bar on
+  # screen as a "processing" sweep while we wait on the server.
+  kill -USR1 "$job" 2>/dev/null || true
+  # `wait` can't be used: talkwave was started by a *different* shell (the
+  # `start` invocation), so it is not a child of this one and wait returns
+  # immediately. Poll for the finished file instead -- or for the recorder
+  # having died, in which case there is nothing more to wait for.
+  for _ in $(seq 1 100); do
+    [ -s "$wav" ] && break
+    kill -0 "$job" 2>/dev/null || break
+    sleep 0.05
+  done
+
+  local text=""
+  if [ -s "$wav" ]; then
+    text="$(transcribe "$wav")"
+  else
+    log "stop: no audio at $wav"
+    notify-send -u critical -a talk "Voice input failed" \
+      "The recorder produced no audio. See ~/.cache/talk.log."
+  fi
+  rm -f "$wav" "$wav.part"
+
+  # Take the bar down BEFORE typing, and wait for it to go: if the compositor
+  # gave the bar keyboard focus, wtype would otherwise type into the bar.
+  kill -TERM "$job" 2>/dev/null || true
+  for _ in $(seq 1 40); do
+    kill -0 "$job" 2>/dev/null || break
+    sleep 0.05
+  done
+
+  if [ -n "$text" ]; then
+    sleep 0.05   # let focus settle back on the previous window
+    log "stop: typing ${#text} chars"
+    wtype -- "$text"
   fi
 }
 
 case "${1:-}" in
-  start)  start ;;
+  start)    start hold ;;
   stop)     stop "$@" ;;
-  watchdog) watchdog ;;
-  toggle) if recording; then stop; else start; fi ;;
-  *) echo "usage: talk {start|stop|toggle|watchdog}" >&2; exit 2 ;;
+  watchdog) watchdog "${2:-}" "${3:-hold}" ;;
+  toggle)   if recording; then stop stop toggle; else start cap; fi ;;
+  *) echo "usage: talk {start|stop|toggle}" >&2; exit 2 ;;
 esac

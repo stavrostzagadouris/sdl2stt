@@ -7,11 +7,11 @@ The rest of the readme is all my good buddy Claude:
 Push-to-talk voice input for Wayland. Hold a key, speak, release — the transcript is typed
 into whatever field has focus.
 
-Two pieces, about 430 lines total:
+Two pieces:
 
 | | |
 |---|---|
-| `talkwave.c` | The recorder. libpulse capture on a dedicated thread, plus a small SDL2 level-meter bar pinned bottom-centre. Writes a finalized WAV on SIGTERM. Knows nothing about transcription. |
+| `talkwave.c` | The recorder. libpulse capture on a dedicated thread, plus a small SDL2 level-meter bar pinned bottom-centre. On SIGUSR1 it writes a finalized WAV and switches the bar to a "processing" sweep; on SIGTERM it exits. Knows nothing about transcription. |
 | `talk` | The orchestration. `start` / `stop` / `toggle`, PID state, a noise gate, the POST to your STT server, and `wtype` to inject the text. This is what your keybind calls. |
 
 Speech-to-text is delegated, not bundled. `talk` POSTs a WAV to any server exposing an
@@ -52,6 +52,9 @@ gcc -O2 -o talkwave talkwave.c \
     $(pkg-config --cflags --libs libpulse-simple)
 install -Dm755 talkwave talk -t ~/.local/bin/
 ```
+
+Install both together. `talk` and `talkwave` talk to each other with signals, and a new
+`talk` paired with an old `talkwave` binary (or the reverse) will lose recordings.
 
 Note `libpulse-simple` is a **separate** pkg-config module from `libpulse`; `pa_simple_*`
 will not link without it.
@@ -143,13 +146,25 @@ requested x/y — so if you want the bar somewhere specific, move it with a rule
 windowrulev2 = move 820 100%-72, class:^(talkwave)$
 ```
 
-`talk toggle` works too, if you prefer press-once-to-start, press-again-to-stop. Holding is
-the better default: a toggle lets recorder state drift out of sync, and holding makes
-"am I recording?" self-evident.
+`talk toggle` works too, if you prefer press-once-to-start, press-again-to-stop. It needs no
+repeating bind — a plain `bind = SUPER, SPACE, exec, talk toggle` is enough — and only the
+2-minute cap applies. Holding is the better default: a toggle lets recorder state drift out
+of sync, and holding makes "am I recording?" self-evident.
+
+`talk start` is push-to-talk only: without the repeating bind feeding it beats, the watchdog
+ends the recording after about a second. Use `talk toggle` from scripts.
+
+### What you see
+
+While you hold, the bar is a level meter. When the hold ends the bar stays up and a group of
+three bars sweeps side to side while the clip is gated and sent to the server. The bar is
+taken down just before the text is typed, so a compositor that gave the bar keyboard focus
+cannot swallow the transcript.
 
 ## Debugging
 
-The compositor discards stderr, so everything goes to `~/.cache/talk.log`:
+The compositor discards stderr, so everything goes to `~/.cache/talk.log` (trimmed to its
+last 2000 lines once it passes about 1 MB):
 
 ```
 tail -f ~/.cache/talk.log
@@ -157,6 +172,9 @@ tail -f ~/.cache/talk.log
 
 Each stop logs the measured peak RMS and loud-window count, so you can see whether the
 noise gate ate your clip before blaming the server.
+
+Recordings live in `$XDG_RUNTIME_DIR` (falling back to `/tmp`) only until they have been
+sent, and are written with mode 0600.
 
 ## Notes from building it
 
@@ -188,14 +206,24 @@ level gate impossible and makes the STT model invent words out of the mush. Chec
 `pactl list sources | grep -m1 'Volume: front-left'`; around 40% was right here.
 
 **A level gate cannot distinguish your voice from a TV.** Both are speech. The gate only
-rejects near-silence — it needs 3+ consecutive 20 ms windows above `TALK_GATE` or it discards
+rejects near-silence — it needs at least three 20 ms windows above `TALK_GATE` or it discards
 the clip and notifies rather than spending a request. It fails *open*: a measurement error
 must never silently drop a real recording.
 
+**Two things can end the same hold.** The watchdog and the panic bind can both fire for one
+release. `talk stop` claims the recording by renaming the state file — atomic, so exactly
+one of them proceeds — otherwise both transcribe the clip and the text is typed twice. For
+the same reason each watchdog is tied to its recorder's PID, so one left over from an
+earlier recording cannot end the next.
+
+**Write struct fields with the size you declared.** The WAV header's `fmt ` chunk size was
+a `uint16_t` written with `fwrite(&x, 4, 1, f)`, which emits two bytes of whatever sits next
+to it on the stack. It happened to be zero in one build and garbage in another.
+
 **`wait` doesn't work across shells.** `talk stop` can't `wait` on the recorder, because
 `talk start` was a different process — the recorder isn't its child, so `wait` returns
-immediately and races `curl` against a WAV that's still being written. Poll `kill -0`
-instead.
+immediately and races `curl` against a WAV that's still being written. `talkwave` writes
+to `<file>.part` and renames it into place, so `talk stop` polls for a non-empty file.
 
 ## A note on exposure
 
