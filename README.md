@@ -63,7 +63,9 @@ Install both together. `talk` and `talkwave` talk to each other with signals, an
 
 ```
 git pull
-gcc -O2 -o talkwave talkwave.c     $(pkg-config --cflags --libs sdl2)     $(pkg-config --cflags --libs libpulse-simple)
+gcc -O2 -o talkwave talkwave.c \
+    $(pkg-config --cflags --libs sdl2) \
+    $(pkg-config --cflags --libs libpulse-simple)
 install -Dm755 talkwave talk -t ~/.local/bin/
 ```
 
