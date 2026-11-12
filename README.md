@@ -56,6 +56,20 @@ install -Dm755 talkwave talk -t ~/.local/bin/
 Install both together. `talk` and `talkwave` talk to each other with signals, and a new
 `talk` paired with an old `talkwave` binary (or the reverse) will lose recordings.
 
+### Updating
+
+`talkwave` is a compiled binary, so pulling new source is not enough. After every
+`git pull`, rebuild and reinstall both files:
+
+```
+git pull
+gcc -O2 -o talkwave talkwave.c     $(pkg-config --cflags --libs sdl2)     $(pkg-config --cflags --libs libpulse-simple)
+install -Dm755 talkwave talk -t ~/.local/bin/
+```
+
+Nothing needs restarting: there is no background process, and the next key press uses the
+new files.
+
 Note `libpulse-simple` is a **separate** pkg-config module from `libpulse`; `pa_simple_*`
 will not link without it.
 
